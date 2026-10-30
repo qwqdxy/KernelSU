@@ -345,12 +345,8 @@ static void initialize_fake_status()
         new_status->sequence = 4;
         new_status->policyload = 1;
 #else
-        /* 5.15 及以下：与 6.10+ 分支保持一致。
-         * 原实现写 0/0，含义是"启动至今策略从未加载过"，而真机上
-         * sequence 已经推进、AVC 也在持续工作 —— 两者互相矛盾，会被
-         * 反 root 工具按 `sequence != 0 && policyload == 0` 命中。 */
-        new_status->sequence = 4;
-        new_status->policyload = 1;
+        new_status->sequence = 0;
+        new_status->policyload = 0;
 #endif
         if (!new_status->enforcing) {
             new_status->enforcing = 1;
