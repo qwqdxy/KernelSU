@@ -1,0 +1,21 @@
+name: Build Custom ksud (with our LKM)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lkm:
+    uses: ./.github/workflows/ddk-lkm.yml
+    with:
+      kmi: android13-5.15
+      package_name: com.tencent.wemeet.app
+      expected_size: '0x0338'
+      expected_hash: '5bfcae7ac71314d3293b3173b0db5781ab23a58d2046c35159fd3bb8d5e0deea'
+
+  ksud:
+    needs: lkm
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: aarch64-linux-android
+      pack_lkm: true
+      package_name: com.tencent.wemeet.app
