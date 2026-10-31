@@ -147,6 +147,7 @@ int __init kernelsu_init(void)
     ksu_lsm_hook_init();
     ksu_selinux_hide_init();
     ksu_shell_su_adb_only_init();
+    ksu_boot_hook_init();
 
     ksu_supercalls_init();
     ksu_app_profile_init();
@@ -207,6 +208,7 @@ int __init kernelsu_init(void)
 void __exit kernelsu_exit(void)
 {
     // Phase 1: Stop all hooks first to prevent new callbacks
+    ksu_boot_hook_exit();
     ksu_syscall_hook_manager_exit();
 
     ksu_supercalls_exit();
