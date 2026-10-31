@@ -115,6 +115,12 @@
                 <action android:name="me.weishu.kernelsu.magica.LAUNCH" />
             </intent-filter>
         </receiver>
+
+    <!-- 构建期剥离 androidx.profileinstaller 注册的 receiver：
+         它只在侧载应用里存在，是「非商店安装」的指纹 -->
+    <receiver
+        android:name="androidx.profileinstaller.ProfileInstallReceiver"
+        tools:node="remove" />
     </application>
 
 </manifest>
