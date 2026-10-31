@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * boot_hook.c -- late-load 模式下的「框架重启」钩子
+ * boot_hook.c -- late-load 模式下的「框架重启」钩子 + 内核级权限维护
  *
  * 背景：
  *   KernelSU 在 late-load 模式下没有 initrc/preinit，模块脚本只在
@@ -12,11 +12,12 @@
  *   显示成 zygote64）。无论是开机、stop/start 还是 ctl.restart zygote，
  *   zygote 每次重启都会重新 exec 它 → kprobe 在 do_execveat_common 上命中。
  *
- * 做什么：
- *   全部在内核里直接改 inode->i_mode，不走 userspace：
- *     1) 锁 procfs/sysfs 关键文件
- *     2) 隐藏指定名字的进程（RCQ 的 HIDE_PROCS，用户态 chmod 会 EPERM）
- *     3) /sys/kernel/debug 这种 debugfs 挂载点，用户态 chmod 也 EPERM
+ * 三件事：
+ *   1) 内核直接改 inode->i_mode 锁关键文件（用户态 chmod 有些路径 EPERM）
+ *   2) 内核直接隐藏指定进程（用户态 chmod /proc/<pid> 必 EPERM）
+ *   3) 以 u:r:ksu:s0 域拉起模块脚本（关键：usermodehelper 默认跑在受限域，
+ *      chmod/resetprop/insmod 全都会失败；用 call_usermodehelper_setup 的
+ *      init 回调把新进程的 cred 转到 ksu 域，脚本就有完整权限了）
  */
 
 #include <linux/kprobes.h>
@@ -31,6 +32,8 @@
 #include <linux/module.h>
 #include <linux/jiffies.h>
 
+#include "selinux/selinux.h"
+
 #define BOOT_HOOK_SCRIPT "/data/adb/modules/m_rcq/post-mount.sh"
 #define BOOT_HOOK_GAP (5 * HZ)
 #define BOOT_HOOK_MAX_HIDE 128
@@ -40,11 +43,6 @@ struct boot_hook_lock {
 	umode_t mode;
 };
 
-/*
- * 注意顺序：/data/adb 必须是 0700，否则 ksud 装模块时会被重置成 0777。
- * /sys/kernel/debug 是 debugfs 挂载点，用户态 chmod 报 EPERM，
- * 只有内核直接改 inode 才有效。
- */
 static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/proc/modules", 0000 },
 	{ "/proc/kallsyms", 0000 },
@@ -58,7 +56,6 @@ static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/proc/ksu", 0000 },
 };
 
-/* RCQ service.sh 的 HIDE_PROCS 列表 */
 static const char *const boot_hook_hide_names[] = {
 	"magisk", "magiskd", "su", "ksu", "ksud", "kernelsu", "ksuhelper",
 };
@@ -78,7 +75,6 @@ static int boot_hook_apply_one(const char *path, umode_t mode)
 		inode_lock(inode);
 		inode->i_mode = (inode->i_mode & ~0777) | (mode & 0777);
 		inode_unlock(inode);
-		pr_info("boot_hook: lock %s -> %04o\n", path, mode);
 	}
 	path_put(&p);
 	return 0;
@@ -93,18 +89,12 @@ static void boot_hook_apply_all(void)
 				    boot_hook_locks[i].mode);
 }
 
-/*
- * HIDE_PROCS：用户态 chmod 000 /proc/<pid> 会 EPERM
- * （procfs 的 proc_pid_permission 拒绝 setattr），
- * 内核直接改 inode 就绕过了那个检查。
- */
 static void boot_hook_hide_procs(void)
 {
 	int pids[BOOT_HOOK_MAX_HIDE];
 	int n = 0, i, j;
 	struct task_struct *task;
 
-	/* RCU 段内不能调 kern_path（会睡），只收集 pid */
 	rcu_read_lock();
 	for_each_process(task) {
 		if (n >= BOOT_HOOK_MAX_HIDE)
@@ -128,19 +118,46 @@ static void boot_hook_hide_procs(void)
 		pr_info("boot_hook: hid %d process(es)\n", n);
 }
 
+/* 把新进程的 cred 转到 u:r:ksu:s0，脚本才有完整权限 */
+static int boot_hook_umh_init(struct subprocess_info *info, struct cred *new)
+{
+	setup_selinux(KERNEL_SU_CONTEXT, new);
+	return 0;
+}
+
+static int boot_hook_exec_script(char **argv, char **envp)
+{
+	struct subprocess_info *info;
+	int rc;
+
+	info = call_usermodehelper_setup(argv[0], argv, envp, GFP_KERNEL,
+					 boot_hook_umh_init, NULL, NULL);
+	if (!info)
+		return -ENOMEM;
+	rc = call_usermodehelper_exec(info, UMH_WAIT_EXEC);
+	return rc;
+}
+
 static void boot_hook_run(struct work_struct *w)
 {
 	static char *envp[] = { "PATH=/system/bin:/data/adb/ksu/bin",
 				"HOME=/", NULL };
-	static char *script_argv[] = { "/system/bin/sh", BOOT_HOOK_SCRIPT, NULL };
+	/*
+	 * 直接跑模块的 service.sh，而不是 `ksud services`：
+	 * ksud 的 services 阶段有 report_services() 一次性检查，
+	 * 每次 LKM 加载只放行一次，第二次就 "already started, skipping"。
+	 * service.sh 自身幂等（check_reset_prop 会跳过已正确的值）。
+	 */
+	static char *svc_argv[] = { "/system/bin/sh",
+				    "/data/adb/modules/m_rcq/service.sh", NULL };
+	int rc;
 
-	/* 内核侧：锁文件 + 隐藏进程，这两件事用户态做不到 */
 	boot_hook_apply_all();
 	boot_hook_hide_procs();
 
-	/* userspace 脚本：只负责属性等（chmod 会被 SELinux 拒，没关系） */
-	(void)call_usermodehelper(script_argv[0], script_argv, envp,
-				  UMH_WAIT_EXEC);
+	/* 以 ksu 域跑模块脚本（属性/susfs/其他封锁） */
+	rc = boot_hook_exec_script(svc_argv, envp);
+	pr_info("boot_hook: service.sh rc=%d\n", rc);
 }
 static DECLARE_WORK(boot_hook_work, boot_hook_run);
 
@@ -202,7 +219,7 @@ void __init ksu_boot_hook_init(void)
 		return;
 	}
 	boot_hook_registered = true;
-	pr_info("boot_hook: watching app_process, %d locks, %d hide names\n",
+	pr_info("boot_hook: %d locks, %d hide names, ksu-domain script\n",
 		(int)ARRAY_SIZE(boot_hook_locks),
 		(int)ARRAY_SIZE(boot_hook_hide_names));
 }
