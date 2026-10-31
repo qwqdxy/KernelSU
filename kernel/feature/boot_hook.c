@@ -48,6 +48,10 @@ static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/sys/fs/selinux/enforce", 0640 },
 	{ "/sys/fs/selinux/policy", 0440 },
 	{ "/data/adb", 0700 },
+	/* RCQ service.sh 里封锁、但内核钩子之前没覆盖的 */
+	{ "/sys/kernel/debug", 0000 },
+	{ "/sys/kernel/debug/tracing", 0000 },
+	{ "/proc/ksu", 0000 },
 };
 
 static unsigned long boot_hook_last;
