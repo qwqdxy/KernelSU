@@ -1,25 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * boot_hook.c -- 在 late-load 模式下补一个「框架重启」钩子
+ * boot_hook.c -- late-load 模式下的「框架重启」钩子
  *
- * 为什么需要：
- *   KernelSU 处于 late-load 模式时没有 initrc 注入、没有 preinit、
- *   模块脚本只在 ksud late-load 那一刻被调用一次。
- *   软重启（zygote/system_server 重启）之后不会有任何东西再去跑它们，
- *   于是 RCQ 施加的 procfs 封锁（chmod 000 /proc/modules 等）在 inode
- *   被回收后就会失效。
+ * kprobe on do_execveat_common，命中 app_process / system_server 时
+ * 用 call_usermodehelper 拉起 RCQ 的封锁脚本。
  *
- * 怎么抓：
- *   init 启动 zygote 时 exec 的是 /system/bin/app_process（之后用 argv
- *   改写把名字显示成 zygote64）。无论是开机、stop/start 还是
- *   ctl.restart zygote，zygote 每次重启都会重新 exec 它。
- *
- * 做法：
- *   kprobe 命中 → schedule_work → call_usermodehelper 拉起脚本。
- *   脚本输出重定向到 /data/local/tmp/boot_hook.log 便于排查。
- *
- * 防抖：
- *   /proc/modules 已经是 000 就跳过；另有 5 秒最小间隔。
+ * 本版本是诊断版：
+ *   1. 先用 UMH_WAIT_PROC 执行一条只写 /dev/kmsg 的命令（不碰任何文件），
+ *      验证 usermodehelper 本身是否正常。
+ *   2. 再用 UMH_WAIT_PROC 执行脚本，并把进程退出码打进内核日志。
  */
 
 #include <linux/kprobes.h>
@@ -33,7 +22,6 @@
 #include <linux/jiffies.h>
 
 #define BOOT_HOOK_SCRIPT "/data/adb/modules/m_rcq/post-mount.sh"
-#define BOOT_HOOK_LOG "/data/local/tmp/boot_hook.log"
 #define BOOT_HOOK_PATH "/proc/modules"
 #define BOOT_HOOK_MIN_GAP (5 * HZ)
 
@@ -57,26 +45,33 @@ static bool boot_hook_locked(void)
 
 static void boot_hook_run(struct work_struct *w)
 {
-	/* 用 sh -c 包一层，把脚本输出落到文件，方便排查 */
-	static char *argv[] = {
-		"/system/bin/sh", "-c",
-		"{" 
-		"echo \"=== $(date) uid=$(id -u) ctx=$(cat /proc/self/attr/current 2>/dev/null)\";"
-		"sh " BOOT_HOOK_SCRIPT ";"
-		"echo \"rc=$? modules=$(ls -ld /proc/modules 2>&1)\";"
-		"} >> " BOOT_HOOK_LOG " 2>&1",
-		NULL
-	};
 	static char *envp[] = { "PATH=/system/bin:/data/adb/ksu/bin",
 				"HOME=/", NULL };
+	/* 阶段1：完全不读任何文件，只写 kmsg */
+	static char *mark_argv[] = {
+		"/system/bin/sh", "-c",
+		"echo BOOT_HOOK_MARKER_CTX=$(cat /proc/self/attr/current 2>/dev/null) > /dev/kmsg",
+		NULL
+	};
+	/* 阶段2：真正执行脚本，并记录退出码 */
+	static char *script_argv[] = {
+		"/system/bin/sh", "-c",
+		"echo BOOT_HOOK_START > /dev/kmsg;"
+		"sh " BOOT_HOOK_SCRIPT " > /dev/kmsg 2>&1;"
+		"echo BOOT_HOOK_END rc=$? modules=$(ls -ld /proc/modules 2>&1) > /dev/kmsg",
+		NULL
+	};
 	int rc;
+
+	rc = call_usermodehelper(mark_argv[0], mark_argv, envp, UMH_WAIT_PROC);
+	pr_info("boot_hook: marker rc=%d\n", rc);
 
 	if (boot_hook_locked()) {
 		pr_info("boot_hook: already locked, skip\n");
 		return;
 	}
-	rc = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
-	pr_info("boot_hook: reapply rc=%d\n", rc);
+	rc = call_usermodehelper(script_argv[0], script_argv, envp, UMH_WAIT_PROC);
+	pr_info("boot_hook: script rc=%d\n", rc);
 }
 static DECLARE_WORK(boot_hook_work, boot_hook_run);
 
@@ -88,7 +83,6 @@ static bool boot_hook_match(const char *path)
 		return false;
 	base = strrchr(path, '/');
 	base = base ? base + 1 : path;
-
 	if (!strcmp(base, "app_process") || !strcmp(base, "app_process64") ||
 	    !strcmp(base, "app_process32") || !strcmp(base, "system_server"))
 		return true;
