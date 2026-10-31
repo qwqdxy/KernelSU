@@ -1,0 +1,36 @@
+name: Build Custom Manager
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build (unsigned)
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager-unsigned
+          path: manager/app/build/outputs/apk/release/*.apk
