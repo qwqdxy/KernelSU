@@ -12,14 +12,11 @@
  *   显示成 zygote64）。无论是开机、stop/start 还是 ctl.restart zygote，
  *   zygote 每次重启都会重新 exec 它 → kprobe 在 do_execveat_common 上命中。
  *
- * 做什么（关键）：
- *   直接在内核里改 inode 的 i_mode —— 不走 userspace，不受 SELinux 约束，
- *   不 fork 进程。之前试过 call_usermodehelper 拉脚本，rc=0 但 chmod
- *   被内核域的限制静默拒绝。
- *
- * 顺带：
- *   仍然尝试用 usermodehelper 跑一遍模块的 post-mount.sh，负责属性类
- *   的操作（属性在软重启后不会丢，所以这一步是锦上添花）。
+ * 做什么：
+ *   全部在内核里直接改 inode->i_mode，不走 userspace：
+ *     1) 锁 procfs/sysfs 关键文件
+ *     2) 隐藏指定名字的进程（RCQ 的 HIDE_PROCS，用户态 chmod 会 EPERM）
+ *     3) /sys/kernel/debug 这种 debugfs 挂载点，用户态 chmod 也 EPERM
  */
 
 #include <linux/kprobes.h>
@@ -29,17 +26,25 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/namei.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/module.h>
 #include <linux/jiffies.h>
 
 #define BOOT_HOOK_SCRIPT "/data/adb/modules/m_rcq/post-mount.sh"
 #define BOOT_HOOK_GAP (5 * HZ)
+#define BOOT_HOOK_MAX_HIDE 128
 
 struct boot_hook_lock {
 	const char *path;
 	umode_t mode;
 };
 
+/*
+ * 注意顺序：/data/adb 必须是 0700，否则 ksud 装模块时会被重置成 0777。
+ * /sys/kernel/debug 是 debugfs 挂载点，用户态 chmod 报 EPERM，
+ * 只有内核直接改 inode 才有效。
+ */
 static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/proc/modules", 0000 },
 	{ "/proc/kallsyms", 0000 },
@@ -48,10 +53,14 @@ static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/sys/fs/selinux/enforce", 0640 },
 	{ "/sys/fs/selinux/policy", 0440 },
 	{ "/data/adb", 0700 },
-	/* RCQ service.sh 里封锁、但内核钩子之前没覆盖的 */
 	{ "/sys/kernel/debug", 0000 },
 	{ "/sys/kernel/debug/tracing", 0000 },
 	{ "/proc/ksu", 0000 },
+};
+
+/* RCQ service.sh 的 HIDE_PROCS 列表 */
+static const char *const boot_hook_hide_names[] = {
+	"magisk", "magiskd", "su", "ksu", "ksud", "kernelsu", "ksuhelper",
 };
 
 static unsigned long boot_hook_last;
@@ -84,16 +93,52 @@ static void boot_hook_apply_all(void)
 				    boot_hook_locks[i].mode);
 }
 
+/*
+ * HIDE_PROCS：用户态 chmod 000 /proc/<pid> 会 EPERM
+ * （procfs 的 proc_pid_permission 拒绝 setattr），
+ * 内核直接改 inode 就绕过了那个检查。
+ */
+static void boot_hook_hide_procs(void)
+{
+	int pids[BOOT_HOOK_MAX_HIDE];
+	int n = 0, i, j;
+	struct task_struct *task;
+
+	/* RCU 段内不能调 kern_path（会睡），只收集 pid */
+	rcu_read_lock();
+	for_each_process(task) {
+		if (n >= BOOT_HOOK_MAX_HIDE)
+			break;
+		for (j = 0; j < ARRAY_SIZE(boot_hook_hide_names); j++) {
+			if (!strcmp(task->comm, boot_hook_hide_names[j])) {
+				pids[n++] = task->pid;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+
+	for (i = 0; i < n; i++) {
+		char path[32];
+
+		snprintf(path, sizeof(path), "/proc/%d", pids[i]);
+		boot_hook_apply_one(path, 0000);
+	}
+	if (n)
+		pr_info("boot_hook: hid %d process(es)\n", n);
+}
+
 static void boot_hook_run(struct work_struct *w)
 {
 	static char *envp[] = { "PATH=/system/bin:/data/adb/ksu/bin",
 				"HOME=/", NULL };
 	static char *script_argv[] = { "/system/bin/sh", BOOT_HOOK_SCRIPT, NULL };
 
-	/* 内核侧直接改权限：这是真正生效的手段 */
+	/* 内核侧：锁文件 + 隐藏进程，这两件事用户态做不到 */
 	boot_hook_apply_all();
+	boot_hook_hide_procs();
 
-	/* userspace 脚本：负责属性等（失败也无所谓） */
+	/* userspace 脚本：只负责属性等（chmod 会被 SELinux 拒，没关系） */
 	(void)call_usermodehelper(script_argv[0], script_argv, envp,
 				  UMH_WAIT_EXEC);
 }
@@ -157,8 +202,9 @@ void __init ksu_boot_hook_init(void)
 		return;
 	}
 	boot_hook_registered = true;
-	pr_info("boot_hook: watching app_process, %d lock targets\n",
-		(int)ARRAY_SIZE(boot_hook_locks));
+	pr_info("boot_hook: watching app_process, %d locks, %d hide names\n",
+		(int)ARRAY_SIZE(boot_hook_locks),
+		(int)ARRAY_SIZE(boot_hook_hide_names));
 }
 
 void __exit ksu_boot_hook_exit(void)
