@@ -13,18 +13,13 @@
  *   init 启动 zygote 时 exec 的是 /system/bin/app_process（之后用 argv
  *   改写把名字显示成 zygote64）。无论是开机、stop/start 还是
  *   ctl.restart zygote，zygote 每次重启都会重新 exec 它。
- *   所以在 do_execveat_common 上挂 kprobe，命中 app_process 就说明
- *   框架（重新）启动了。
  *
- * 做什么：
- *   用 call_usermodehelper 以 root 拉起
- *   /data/adb/modules/m_rcq/post-mount.sh，把封锁补回去。
- *   不能在 kprobe 上下文里直接调用，所以走 workqueue 延后到进程上下文。
+ * 做法：
+ *   kprobe 命中 → schedule_work → call_usermodehelper 拉起脚本。
+ *   脚本输出重定向到 /data/local/tmp/boot_hook.log 便于排查。
  *
- * 防抖动：
- *   app_process 不只在 zygote 启动时被 exec —— settings/am/pm 这类
- *   工具也是用它跑的。所以触发前先看 /proc/modules 是不是已经 000，
- *   已经是就直接跳过，避免每次跑命令都拉起一遍脚本。
+ * 防抖：
+ *   /proc/modules 已经是 000 就跳过；另有 5 秒最小间隔。
  */
 
 #include <linux/kprobes.h>
@@ -38,12 +33,12 @@
 #include <linux/jiffies.h>
 
 #define BOOT_HOOK_SCRIPT "/data/adb/modules/m_rcq/post-mount.sh"
+#define BOOT_HOOK_LOG "/data/local/tmp/boot_hook.log"
 #define BOOT_HOOK_PATH "/proc/modules"
-#define BOOT_HOOK_MIN_GAP (5 * HZ) /* 至少间隔 5 秒，防抖 */
+#define BOOT_HOOK_MIN_GAP (5 * HZ)
 
 static unsigned long boot_hook_last;
 
-/* /proc/modules 的权限是不是已经被改成 000 了 */
 static bool boot_hook_locked(void)
 {
 	struct path path;
@@ -62,7 +57,16 @@ static bool boot_hook_locked(void)
 
 static void boot_hook_run(struct work_struct *w)
 {
-	static char *argv[] = { "/system/bin/sh", BOOT_HOOK_SCRIPT, NULL };
+	/* 用 sh -c 包一层，把脚本输出落到文件，方便排查 */
+	static char *argv[] = {
+		"/system/bin/sh", "-c",
+		"{" 
+		"echo \"=== $(date) uid=$(id -u) ctx=$(cat /proc/self/attr/current 2>/dev/null)\";"
+		"sh " BOOT_HOOK_SCRIPT ";"
+		"echo \"rc=$? modules=$(ls -ld /proc/modules 2>&1)\";"
+		"} >> " BOOT_HOOK_LOG " 2>&1",
+		NULL
+	};
 	static char *envp[] = { "PATH=/system/bin:/data/adb/ksu/bin",
 				"HOME=/", NULL };
 	int rc;
@@ -85,7 +89,6 @@ static bool boot_hook_match(const char *path)
 	base = strrchr(path, '/');
 	base = base ? base + 1 : path;
 
-	/* zygote 的可执行文件；部分 ROM 会直接 exec system_server */
 	if (!strcmp(base, "app_process") || !strcmp(base, "app_process64") ||
 	    !strcmp(base, "app_process32") || !strcmp(base, "system_server"))
 		return true;
@@ -98,7 +101,6 @@ static int boot_hook_exec_pre(struct kprobe *p, struct pt_regs *regs)
 	unsigned long now;
 
 #if defined(__aarch64__)
-	/* do_execveat_common(int fd, struct filename *filename, ...) */
 	fn = (struct filename *)regs->regs[1];
 #elif defined(__x86_64__)
 	fn = (struct filename *)(uintptr_t)regs->si;
