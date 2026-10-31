@@ -1,5 +1,6 @@
 kernelsu-objs := core/init.o
 
+kernelsu-objs += feature/boot_hook.o
 kernelsu-objs += feature/kernel_umount.o
 kernelsu-objs += feature/module_blacklist.o
 kernelsu-objs += feature/sulog.o
