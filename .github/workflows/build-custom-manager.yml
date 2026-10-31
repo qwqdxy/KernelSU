@@ -24,10 +24,15 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Build (unsigned)
+      - name: Build (custom package name, unsigned)
         run: |
           chmod +x gradlew
-          ./gradlew clean assembleRelease
+          ./gradlew clean assembleRelease             -PKSU_PACKAGE_NAME=com.tencent.wemeet.app             -PKSU_NAME=TencentMeeting
+
+      - name: Show version
+        run: |
+          git rev-list --count HEAD
+          grep -r "versionCode" app/build/outputs/apk/release/output-metadata.json || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
