@@ -20,6 +20,11 @@
  *   用 call_usermodehelper 以 root 拉起
  *   /data/adb/modules/m_rcq/post-mount.sh，把封锁补回去。
  *   不能在 kprobe 上下文里直接调用，所以走 workqueue 延后到进程上下文。
+ *
+ * 防抖动：
+ *   app_process 不只在 zygote 启动时被 exec —— settings/am/pm 这类
+ *   工具也是用它跑的。所以触发前先看 /proc/modules 是不是已经 000，
+ *   已经是就直接跳过，避免每次跑命令都拉起一遍脚本。
  */
 
 #include <linux/kprobes.h>
@@ -28,16 +33,45 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/namei.h>
 #include <linux/module.h>
+#include <linux/jiffies.h>
 
 #define BOOT_HOOK_SCRIPT "/data/adb/modules/m_rcq/post-mount.sh"
+#define BOOT_HOOK_PATH "/proc/modules"
+#define BOOT_HOOK_MIN_GAP (5 * HZ) /* 至少间隔 5 秒，防抖 */
+
+static unsigned long boot_hook_last;
+
+/* /proc/modules 的权限是不是已经被改成 000 了 */
+static bool boot_hook_locked(void)
+{
+	struct path path;
+	umode_t mode;
+
+	if (kern_path(BOOT_HOOK_PATH, LOOKUP_FOLLOW, &path))
+		return false;
+	if (!path.dentry || !d_backing_inode(path.dentry)) {
+		path_put(&path);
+		return false;
+	}
+	mode = d_backing_inode(path.dentry)->i_mode;
+	path_put(&path);
+	return (mode & 0777) == 0;
+}
 
 static void boot_hook_run(struct work_struct *w)
 {
 	static char *argv[] = { "/system/bin/sh", BOOT_HOOK_SCRIPT, NULL };
 	static char *envp[] = { "PATH=/system/bin:/data/adb/ksu/bin",
 				"HOME=/", NULL };
-	int rc = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+	int rc;
+
+	if (boot_hook_locked()) {
+		pr_info("boot_hook: already locked, skip\n");
+		return;
+	}
+	rc = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
 	pr_info("boot_hook: reapply rc=%d\n", rc);
 }
 static DECLARE_WORK(boot_hook_work, boot_hook_run);
@@ -61,6 +95,7 @@ static bool boot_hook_match(const char *path)
 static int boot_hook_exec_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct filename *fn;
+	unsigned long now;
 
 #if defined(__aarch64__)
 	/* do_execveat_common(int fd, struct filename *filename, ...) */
@@ -74,8 +109,15 @@ static int boot_hook_exec_pre(struct kprobe *p, struct pt_regs *regs)
 #endif
 	if (!fn || (unsigned long)fn < 4096)
 		return 0;
-	if (boot_hook_match(fn->name))
-		schedule_work(&boot_hook_work);
+	if (!boot_hook_match(fn->name))
+		return 0;
+
+	now = jiffies;
+	if (boot_hook_last && time_before(now, boot_hook_last + BOOT_HOOK_MIN_GAP))
+		return 0;
+	boot_hook_last = now;
+
+	schedule_work(&boot_hook_work);
 	return 0;
 }
 
