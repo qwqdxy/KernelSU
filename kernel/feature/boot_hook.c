@@ -47,6 +47,7 @@ static const struct boot_hook_lock boot_hook_locks[] = {
 	{ "/proc/net/unix", 0440 },
 	{ "/sys/fs/selinux/enforce", 0640 },
 	{ "/sys/fs/selinux/policy", 0440 },
+	{ "/data/adb", 0700 },
 };
 
 static unsigned long boot_hook_last;
